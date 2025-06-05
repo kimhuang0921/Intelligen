@@ -21,6 +21,9 @@ import re
 from dataclasses import dataclass
 from typing import List, Optional
 import getpass
+import csv
+import argparse
+import sys
 
 class Config:
     BASE_DIR = Path("/work/kimhuang/1_Python/10_IntelliGen")
@@ -33,11 +36,29 @@ class Config:
     TESTPROGRAM_DIR = Path("/projects/ga0/patterns/testprogram")
     FALLBACK_ROOT = Path("/projects/ga0/patterns/release_pattern/src")
     SOURCE_DIR = Path("/work/kimhuang/1_Python/10_IntelliGen/source")
+    QUEUE_FILE = BASE_DIR / "IntelliGen_WorkQueue.csv"
     SCOPES = [
         "https://www.googleapis.com/auth/spreadsheets.readonly",
         "https://www.googleapis.com/auth/drive.readonly"
     ]
     TARGET_SUFFIXES = [".pat", "_wvt.spec", "_tim.spec", "_spec_decl.spec", "_seq.seq", "_specs.spec"]
+
+def ensure_queue_file():
+    os.makedirs(os.path.dirname(Config.QUEUE_FILE), exist_ok=True)
+    if not os.path.exists(Config.QUEUE_FILE):
+        with open(Config.QUEUE_FILE, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["TabName", "Status", "Submitter", "Email", "SubmitTime", "LastUpdate"])
+
+def submit_task(tab_name):
+    ensure_queue_file()
+    submitter = getpass.getuser()
+    email = f"{submitter}@rivosinc.com"
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with open(Config.QUEUE_FILE, "a", newline="") as f:
+        writer = csv.writer(f, quoting=csv.QUOTE_ALL)
+        writer.writerow([tab_name, "WAIT", submitter, email, now, ""])
+    print(f"[INFO] Successfully submitted tab '{tab_name}' to the queue as user '{submitter}'.")
 
 def extract_file_base(filepath: str) -> str:
     name = Path(filepath.strip()).name
@@ -303,11 +324,11 @@ def rsync_pattern_files(csv_path: Path, raw_dir: Path, debug_dir: Path, config: 
         pd.DataFrame(results).to_csv(summary_file, index=False)
         os.chmod(summary_file, 0o777)
         print(f"Step 4: Rsync completed: {summary_file}")
-#        print(f"Step 4: .pat files copied to: {patterns_dir}")
         return output_dir
     except Exception as e:
         print(format_error_message("Step 4: Rsync failed", e))
         raise
+
 def generate_timing_files(csv_path: Path, temp_dir: Path, debug_dir: Path) -> None:
     try:
         input_dir = temp_dir
@@ -319,10 +340,6 @@ def generate_timing_files(csv_path: Path, temp_dir: Path, debug_dir: Path) -> No
             raise ValueError("CSV missing required column: Suites")
         df["PatternName"] = df["Suites"].apply(lambda x: Path(str(x)).stem.replace(".stil", "").replace(".gz", ""))
         pattern_set = set(df["PatternName"].tolist())
-#        print(f"Pattern set: {pattern_set}")
-#        print(f"Files in input_dir: {[f.name for f in input_dir.iterdir() if f.is_file()]}")
-        
-        # 儲存每個模式對應的 period_var
         period_vars = {}
         
         def read_header(lines):
@@ -344,17 +361,14 @@ def generate_timing_files(csv_path: Path, temp_dir: Path, debug_dir: Path) -> No
             return pin_list
         def get_period_from_spec_decl(path_in: Path) -> str:
             try:
-#                print(f"Reading _spec_decl.spec file: {path_in}")
                 if not path_in.exists():
                     print(f"Error: File {path_in} does not exist")
                     return "per_40"
                 lines = path_in.read_text(encoding='utf-8').splitlines()
                 for line in lines:
- #                   print(f"Processing line: '{line}'")
                     match = re.match(r'\s*var\s+\w+\s+(\w+)\s*;', line.strip())
                     if match:
                         var_name = match.group(1)
- #                       print(f"Found variable: {var_name}")
                         return var_name
                 print(f"Warning: No variable found in {path_in}, using default per_40")
                 return "per_40"
@@ -375,6 +389,28 @@ def generate_timing_files(csv_path: Path, temp_dir: Path, debug_dir: Path) -> No
             except Exception as e:
                 print(f"Error reading {path_in}: {e}")
                 return "wft"
+        def extract_spec_block(path_in: Path) -> List[str]:
+            try:
+                if not path_in.exists():
+                    print(f"Error: File {path_in} does not exist")
+                    return []
+                lines = path_in.read_text(encoding='utf-8').splitlines()
+                spec_lines = []
+                in_spec_block = False
+                for line in lines:
+                    stripped = line.strip()
+                    if stripped.startswith("spec ") and "{" in stripped:
+                        in_spec_block = True
+                        continue
+                    if in_spec_block:
+                        if stripped == "}":
+                            break
+                        if stripped and not stripped.startswith("//"):
+                            spec_lines.append(f"\t\t{stripped}")
+                return spec_lines
+            except Exception as e:
+                print(f"Error reading spec block from {path_in}: {str(e)}")
+                return []
         def handle_spec_decl(path_in, path_out, pattern):
             lines = path_in.read_text().splitlines()
             header_end_idx = 0
@@ -393,23 +429,30 @@ def generate_timing_files(csv_path: Path, temp_dir: Path, debug_dir: Path) -> No
         def handle_specs(path_in, path_out, pattern):
             lines = path_in.read_text().splitlines()
             header = read_header(lines)
+            spec_lines = extract_spec_block(path_in)
             imports = [
                 f"import Timings.global.{pattern}_spec_decl;",
                 f"import Timings.global.{pattern}_tim;",
                 f"import Timings.global.{pattern}_wvt;",
                 "import configuration.IO_Group;",
-                "import Timings.global.AllRefClkPins10ns_diff_tim;",
-                "",
-                f"spec {pattern}_specs {{",
+                "import Timings.global.AllRefClkPins10ns_diff_specs;",
+                ""
+            ]
+            fixed_specs = [
                 "\t\tper_AllRefClkPins10ns = 10.00 ns;",
-                "\t\tRatio = 1.0;",
+                "\t\tRatio = 1.0;"
+            ]
+            spec_content = spec_lines + fixed_specs
+            spec_block = [
+                f"spec {pattern}_specs {{",
+                *spec_content,
                 "}"
             ]
-            path_out.write_text('\n'.join(header + [""] + imports) + '\n')
+            content = header + [""] + imports + spec_block
+            path_out.write_text('\n'.join(content) + '\n')
             format_file(path_out)
             os.chmod(path_out, 0o777)
         def handle_tim(path_in, path_out, pattern, period_var):
-#            print(f"Generating _tim.spec for pattern {pattern} with period_var: {period_var}")
             lines = path_in.read_text().splitlines()
             header = read_header(lines)
             pad_signals, setup_blocks = [], []
@@ -432,7 +475,7 @@ def generate_timing_files(csv_path: Path, temp_dir: Path, debug_dir: Path) -> No
                         setup_blocks.append("}\n")
                         capture = False
             gallio_block = [
-                f"setup digInOut G_ALL_IO - {' - '.join(pad_signals)} {{",
+                f"setup digInOut G_ALL_IO - G_ref - {' - '.join(pad_signals)} {{",
                 f"    set timing {wft_name} {{",
                 append_ratio(f"        period = {period_var};", period_var),
                 append_ratio(f"        d1 = 0.0 * {period_var};", period_var),
@@ -485,12 +528,10 @@ def generate_timing_files(csv_path: Path, temp_dir: Path, debug_dir: Path) -> No
             format_file(ratio_file)
             os.chmod(ratio_file, 0o777)
         
-        # 第一遍：處理 _spec_decl.spec 文件，儲存 period_var
         for file in input_dir.iterdir():
             if not file.is_file() or file.suffix != ".spec":
                 continue
             name = file.stem
- #           print(f"Processing file: {file.name}")
             matched = None
             for pat in pattern_set:
                 if name.startswith(pat):
@@ -504,13 +545,11 @@ def generate_timing_files(csv_path: Path, temp_dir: Path, debug_dir: Path) -> No
                 period_vars[matched] = period_var
                 handle_spec_decl(file, output_dir / file.name, matched)
         
-        # 第二遍：處理其他 .spec 文件，使用對應的 period_var
         spec_files_found = False
         for file in input_dir.iterdir():
             if not file.is_file() or file.suffix != ".spec":
                 continue
             name = file.stem
-#            print(f"Processing file: {file.name}")
             matched = None
             for pat in pattern_set:
                 if name.startswith(pat):
@@ -520,7 +559,6 @@ def generate_timing_files(csv_path: Path, temp_dir: Path, debug_dir: Path) -> No
                 print(f"No pattern match for file: {file.name}")
                 continue
             spec_files_found = True
-            # 使用對應模式的 period_var，默認為 per_40
             period_var = period_vars.get(matched, "per_40")
             if "_specs" in name:
                 handle_specs(file, output_dir / file.name, matched)
@@ -569,10 +607,10 @@ def generate_flow_files(csv_path: Path, debug_dir: Path, timestamp: str) -> None
         class FlowConfig:
             extensions: List[str] = None
             default_testmethod: str = "FunctionalTest_wo_profiling"
-            default_timing_prefix: str = "Timings"
+            default_timing_prefix: str = "Timings.global."
             level_spec: str = "Levels.DFT_Vtyp.DFT_Vtyp_specValue"
-            max_failed_cycles: int = 2000
-            ffv_cycles: int = 2000
+            max_failed_cycles: int = 20000
+            ffv_cycles: int = 20000
             use_integer_steps: bool = False
             suite_template: str = """    suite {name} calls digital.{testmethod} {{
         timingSpec    = setupRef({timingspec});
@@ -609,13 +647,13 @@ def generate_flow_files(csv_path: Path, debug_dir: Path, timestamp: str) -> None
             axis[Y_axis] = {{
                 resourceType = specVariable;
                 resourceName = "{y_timing_spec}";
-                range.resolution = {y_steps};
+                range.steps = {y_steps};
                 range.start = {y_start};
                 range.stop = {y_stop};
                 {tracking_blocks}
             }};
         }}
-    """
+"""
             shmoo_x_only_template: str = """        shmoo shmoo_{db_id} {{
             target = {target};
             axis[X_axis] = {{
@@ -626,7 +664,7 @@ def generate_flow_files(csv_path: Path, debug_dir: Path, timestamp: str) -> None
                 range.stop = {x_stop};
             }};
         }}
-    """
+"""
             def __post_init__(self):
                 if self.extensions is None:
                     self.extensions = [".stil.gz", ".stil", ".STIL.GZ", ".STIL"]
@@ -662,25 +700,31 @@ def generate_flow_files(csv_path: Path, debug_dir: Path, timestamp: str) -> None
                 os.chmod(self.output_dir, 0o777)
             def parse_time(self, value):
                 try:
+                    if pd.isna(value):
+                        print(f"Step 7: Invalid time value (NaN or None): {value}")
+                        return 0.0
                     if isinstance(value, (int, float)):
-                        return float(value)
+                        return abs(float(value))
                     value = str(value).lower().strip()
+                    if not value:
+                        print(f"Step 7: Empty time value")
+                        return 0.0
                     match = re.match(r"([-]?\d*\.?\d*)\s*(ns|us|ms|s)?", value)
                     if not match:
                         print(f"Step 7: Invalid time format: {value}")
-                        return float(value)
+                        return 0.0
                     num, unit = match.groups()
                     num = float(num)
                     if unit == "ns":
-                        return num * 1e-9
+                        return abs(num * 1e-9)
                     elif unit == "us":
-                        return num * 1e-6
+                        return abs(num * 1e-6)
                     elif unit == "ms":
-                        return num * 1e-3
-                    return num
-                except (ValueError, TypeError):
-                    print(f"Step 7: Invalid time value: {value}")
-                    return float(value)
+                        return abs(num * 1e-3)
+                    return abs(num)
+                except (ValueError, TypeError) as e:
+                    print(f"Step 7: Failed to parse time value: {value}, Error: {str(e)}")
+                    return 0.0
             def generate_tracking_blocks(self, preamble_suites: List[str], y_start: float, y_stop: float) -> str:
                 tracking_blocks = ""
                 for i, suite in enumerate(preamble_suites, 1):
@@ -728,20 +772,29 @@ def generate_flow_files(csv_path: Path, debug_dir: Path, timestamp: str) -> None
                             x_steps = abs(x_steps)
                         y_start = self.parse_time(main_row["shmoo y start"])
                         y_stop = self.parse_time(main_row["shmoo y stop"])
+                        if y_start < 0 or y_stop < 0:
+                            print(f"Step 7: Negative Y values detected for {db_id}: y_start={y_start}, y_stop={y_stop}")
+                            y_start = abs(y_start)
+                            y_stop = abs(y_stop)
                         y_steps_raw = main_row.get("shmoo y step size")
-                        y_steps = self.parse_time(y_steps_raw) if pd.notna(y_steps_raw) else 0
-                        if y_start > y_stop and y_steps > 0:
-                            y_steps = -abs(y_steps)
-                        elif y_start < y_stop and y_steps < 0:
-                            y_steps = abs(y_steps)
+                        if pd.notna(y_steps_raw) and y_steps_raw != "0":
+                            y_range = abs(y_start - y_stop)
+                            y_step_size = self.parse_time(y_steps_raw)
+                            if y_step_size == 0:
+                                print(f"Step 7: Invalid y step size for {db_id}, setting steps to 0")
+                                y_steps = 0
+                            else:
+                                y_steps = int(y_range / y_step_size) if y_range > 0 else 0
+                        else:
+                            y_steps = 0
                         if self.config.use_integer_steps:
                             x_steps = int(abs(x_steps)) if x_steps != 0 else 0
                             y_steps = int(abs(y_steps)) if y_steps != 0 else 0
-                        is_2d = y_steps != 0 and pd.notna(y_steps_raw) and y_steps_raw != "0"
+                        is_2d = y_steps != 0
                         if suite_names:
                             y_suite = suite_names[-1]
                             preamble_suites = suite_names[:-1]
-                            y_timing_spec = f"{self.config.default_timing_prefix}.{y_suite}.per_AllRefClkPins10ns"
+                            y_timing_spec = f"{self.config.default_timing_prefix}.{y_suite}_specs.per_AllRefClkPins10ns"
                             tracking_blocks = self.generate_tracking_blocks(preamble_suites, y_start, y_stop)
                         else:
                             y_timing_spec = ""
@@ -862,7 +915,7 @@ def copy_to_testprogram(zip_file: Path, batch_id: str, config: Config) -> Path:
         print(format_error_message("Step 8.2: Copy failed", e))
         raise
 
-def send_email(submitter_email: str, batch_id: str, zip_file: Path, config: Config) -> None:
+def send_email(submitter_email: str, batch_id: str, zip_file: Path, config: Config, log_content: str = "") -> None:
     try:
         with open(config.CONFIG_FILE, "r") as f:
             email_config = json.load(f)["email"]
@@ -873,9 +926,12 @@ def send_email(submitter_email: str, batch_id: str, zip_file: Path, config: Conf
         body = f"""
 Dear Submitter,
 
-Your IntelliGen task ({batch_id}) has been successfully completed.
+Your IntelliGen task ({batch_id}) has been processed.
 The output files are packaged in: {zip_file}
 Copied to: {config.TESTPROGRAM_DIR}/{batch_id}.zip
+
+Process Log:
+{log_content}
 
 Best regards,
 IntelliGen Automation
@@ -901,6 +957,7 @@ IntelliGen Automation
     except Exception as e:
         print(format_error_message("Step 9: Email sending failed", e))
         raise
+
 def copy_source_files(raw_dir: Path, debug_dir: Path, config: Config, timestamp: str) -> None:
     try:
         patterns_dir = debug_dir / "Patterns" / "global"
@@ -916,9 +973,9 @@ def copy_source_files(raw_dir: Path, debug_dir: Path, config: Config, timestamp:
                     src_path = Path(root) / file
                     if file.endswith(".pat"):
                         dst_path = patterns_dir / file
-                    else:  # .spec files (_wvt.spec, _tim.spec, _spec_decl.spec, _specs.spec)
+                    else:
                         dst_path = timings_dir / file
-                    shutil.copy2(src_path, dst_path)  # Use copy2 to preserve metadata
+                    shutil.copy2(src_path, dst_path)
                     os.chmod(dst_path, 0o777)
                     results.append({"File": file, "CopiedTo": str(dst_path), "Status": "SUCCESS"})
         summary_file = raw_dir / f"source_copy_summary_{timestamp}.csv"
@@ -928,46 +985,75 @@ def copy_source_files(raw_dir: Path, debug_dir: Path, config: Config, timestamp:
     except Exception as e:
         print(format_error_message("Step 6.1: Source copy failed", e))
         raise
-def main(tab_name: str, email: str):
+
+def process_queue():
     config = Config()
-    try:
-        if not tab_name or not email:
-            raise ValueError("Tab name and email are required")
-        timestamp = datetime.now().strftime("%m%d%H%M%S")
-        batch_id = f"{tab_name}_{timestamp}"
-        raw_dir = config.RAW_DIR / batch_id
-        debug_dir = raw_dir / f"DEBUG_{timestamp}"
-        raw_dir.mkdir(parents=True, exist_ok=True)
-        debug_dir.mkdir(parents=True, exist_ok=True)
-        os.chmod(raw_dir, 0o777)
-        os.chmod(debug_dir, 0o777)
-        for subdir in ["Patterns", "Timings", "Flows"]:
-            subdir_path = debug_dir / subdir
-            subdir_path.mkdir(parents=True, exist_ok=True)
-            os.chmod(subdir_path, 0o777)
-        xlsx_path = download_google_sheet(config, timestamp)
-        os.chmod(xlsx_path, 0o777)
-        csv_path = convert_excel_to_csv(xlsx_path, tab_name, raw_dir)
-        os.chmod(csv_path, 0o777)
-        temp_dir = rsync_pattern_files(csv_path, raw_dir, debug_dir, config, timestamp)
-        os.chmod(temp_dir, 0o777)
-        generate_timing_files(csv_path, temp_dir, debug_dir)
-        generate_sequence_files(csv_path, debug_dir)
-        copy_source_files(raw_dir, debug_dir, config, timestamp)
-        generate_flow_files(csv_path, debug_dir, timestamp)
-        zip_file = package_outputs(debug_dir, batch_id)
-        dest_zip = copy_to_testprogram(zip_file, batch_id, config)
-        send_email(email, batch_id, dest_zip, config)
-        print(f"Workflow completed for tab '{tab_name}'")
-    except Exception as e:
-        print(format_error_message("Workflow failed", e))
-        raise
+    ensure_queue_file()
+    df = pd.read_csv(config.QUEUE_FILE)
+    pending_tasks = df[df["Status"] == "WAIT"]
+    for _, row in pending_tasks.iterrows():
+        tab_name = row["TabName"]
+        email = row["Email"]
+        log_buffer = io.StringIO()
+        original_stdout = sys.stdout
+        sys.stdout = log_buffer
+        try:
+            timestamp = datetime.now().strftime("%m%d%H%M%S")
+            batch_id = f"{tab_name}_{timestamp}"
+            raw_dir = config.RAW_DIR / batch_id
+            debug_dir = raw_dir / f"DEBUG_{timestamp}"
+            raw_dir.mkdir(parents=True, exist_ok=True)
+            debug_dir.mkdir(parents=True, exist_ok=True)
+            os.chmod(raw_dir, 0o777)
+            os.chmod(debug_dir, 0o777)
+            for subdir in ["Patterns", "Timings", "Flows"]:
+                subdir_path = debug_dir / subdir
+                subdir_path.mkdir(parents=True, exist_ok=True)
+                os.chmod(subdir_path, 0o777)
+            xlsx_path = download_google_sheet(config, timestamp)
+            os.chmod(xlsx_path, 0o777)
+            csv_path = convert_excel_to_csv(xlsx_path, tab_name, raw_dir)
+            os.chmod(csv_path, 0o777)
+            temp_dir = rsync_pattern_files(csv_path, raw_dir, debug_dir, config, timestamp)
+            os.chmod(temp_dir, 0o777)
+            generate_timing_files(csv_path, temp_dir, debug_dir)
+            generate_sequence_files(csv_path, debug_dir)
+            copy_source_files(raw_dir, debug_dir, config, timestamp)
+            generate_flow_files(csv_path, debug_dir, timestamp)
+            zip_file = package_outputs(debug_dir, batch_id)
+            dest_zip = copy_to_testprogram(zip_file, batch_id, config)
+            sys.stdout = original_stdout
+            log_content = log_buffer.getvalue()
+            send_email(email, batch_id, dest_zip, config, log_content)
+            df.loc[df["TabName"] == tab_name, "Status"] = "DONE"
+            df.loc[df["TabName"] == tab_name, "LastUpdate"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            df.to_csv(config.QUEUE_FILE, index=False, quoting=csv.QUOTE_ALL)
+            print(f"Workflow completed for tab '{tab_name}'")
+        except Exception as e:
+            sys.stdout = original_stdout
+            log_content = log_buffer.getvalue()
+            print(format_error_message(f"Workflow failed for tab '{tab_name}'", e))
+            send_email(email, batch_id, zip_file if 'zip_file' in locals() else Path("N/A"), config, log_content)
+            df.loc[df["TabName"] == tab_name, "Status"] = "FAILED"
+            df.loc[df["TabName"] == tab_name, "LastUpdate"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            df.to_csv(config.QUEUE_FILE, index=False, quoting=csv.QUOTE_ALL)
+        finally:
+            log_buffer.close()
+
+def main(tab_name: str = None, email: str = None, generate: bool = False):
+    if generate:
+        process_queue()
+        return
+    if tab_name:
+        submit_task(tab_name)
+        return
+    print("Error: Either --tab or --gen must be provided.")
 
 if __name__ == "__main__":
-    import argparse
-    parser = argparse.ArgumentParser(description="Run IntelliGen workflow for a specific tab.")
-    parser.add_argument("--tab", required=True, help="Tab name in IntelliGen Submit sheet")
+    parser = argparse.ArgumentParser(description="IntelliGen workflow: submit tasks or process queue for cronjob.")
+    parser.add_argument("--tab", help="Tab name in IntelliGen Submit sheet to submit")
+    parser.add_argument("--gen", action="store_true", help="Process pending tasks in queue (for cronjob)")
     args = parser.parse_args()
     submitter = getpass.getuser()
     email = f"{submitter}@rivosinc.com"
-    main(args.tab, email)
+    main(args.tab, email, args.gen)
