@@ -303,12 +303,11 @@ def rsync_pattern_files(csv_path: Path, raw_dir: Path, debug_dir: Path, config: 
         pd.DataFrame(results).to_csv(summary_file, index=False)
         os.chmod(summary_file, 0o777)
         print(f"Step 4: Rsync completed: {summary_file}")
-        print(f"Step 4: .pat files copied to: {patterns_dir}")
+#        print(f"Step 4: .pat files copied to: {patterns_dir}")
         return output_dir
     except Exception as e:
         print(format_error_message("Step 4: Rsync failed", e))
         raise
-
 def generate_timing_files(csv_path: Path, temp_dir: Path, debug_dir: Path) -> None:
     try:
         input_dir = temp_dir
@@ -320,6 +319,12 @@ def generate_timing_files(csv_path: Path, temp_dir: Path, debug_dir: Path) -> No
             raise ValueError("CSV missing required column: Suites")
         df["PatternName"] = df["Suites"].apply(lambda x: Path(str(x)).stem.replace(".stil", "").replace(".gz", ""))
         pattern_set = set(df["PatternName"].tolist())
+#        print(f"Pattern set: {pattern_set}")
+#        print(f"Files in input_dir: {[f.name for f in input_dir.iterdir() if f.is_file()]}")
+        
+        # 儲存每個模式對應的 period_var
+        period_vars = {}
+        
         def read_header(lines):
             header = []
             in_header = False
@@ -337,14 +342,39 @@ def generate_timing_files(csv_path: Path, temp_dir: Path, debug_dir: Path) -> No
             pin_expr = setup_line.strip().removeprefix("setup digInOut").strip().rstrip("{").strip()
             pin_list = [p.strip() for p in re.split(r"[+]", pin_expr)]
             return pin_list
-        def get_period_from_spec_decl(path_in: Path) -> tuple:
-            lines = path_in.read_text().splitlines()
-            for line in lines:
-                match = re.match(r'\s*var\s+\w+\s+(per_\d+)\s*=\s*([\d.]+)\s*ns\s*;', line.strip())
-                if match:
-                    var_name, value = match.groups()
-                    return var_name, float(value)
-            return "per_40", 40.0
+        def get_period_from_spec_decl(path_in: Path) -> str:
+            try:
+#                print(f"Reading _spec_decl.spec file: {path_in}")
+                if not path_in.exists():
+                    print(f"Error: File {path_in} does not exist")
+                    return "per_40"
+                lines = path_in.read_text(encoding='utf-8').splitlines()
+                for line in lines:
+ #                   print(f"Processing line: '{line}'")
+                    match = re.match(r'\s*var\s+\w+\s+(\w+)\s*;', line.strip())
+                    if match:
+                        var_name = match.group(1)
+ #                       print(f"Found variable: {var_name}")
+                        return var_name
+                print(f"Warning: No variable found in {path_in}, using default per_40")
+                return "per_40"
+            except Exception as e:
+                print(f"Error reading {path_in}: {str(e)}")
+                return "per_40"
+        def extract_wft_name(path_in: Path) -> str:
+            try:
+                lines = path_in.read_text().splitlines()
+                for line in lines:
+                    match = re.match(r'\s*set\s+([^\s;]+);\s*$', line.strip())
+                    if match:
+                        wft_name = match.group(1).strip()
+                        if wft_name and not wft_name[0].isdigit():
+                            return wft_name
+                print(f"Warning: No valid timing name found in {path_in}, using default 'wft'")
+                return "wft"
+            except Exception as e:
+                print(f"Error reading {path_in}: {e}")
+                return "wft"
         def handle_spec_decl(path_in, path_out, pattern):
             lines = path_in.read_text().splitlines()
             header_end_idx = 0
@@ -360,7 +390,7 @@ def generate_timing_files(csv_path: Path, temp_dir: Path, debug_dir: Path) -> No
             path_out.write_text('\n'.join(updated) + '\n')
             format_file(path_out)
             os.chmod(path_out, 0o777)
-        def handle_specs(path_in, path_out, pattern, period_var, period_value):
+        def handle_specs(path_in, path_out, pattern):
             lines = path_in.read_text().splitlines()
             header = read_header(lines)
             imports = [
@@ -368,23 +398,24 @@ def generate_timing_files(csv_path: Path, temp_dir: Path, debug_dir: Path) -> No
                 f"import Timings.global.{pattern}_tim;",
                 f"import Timings.global.{pattern}_wvt;",
                 "import configuration.IO_Group;",
-                "import Timings.global.AllRefClkPins10ns_diff_tim_specs;",
+                "import Timings.global.AllRefClkPins10ns_diff_tim;",
                 "",
                 f"spec {pattern}_specs {{",
-                "\t\tpre_AllRefClkPins10ns_wvt = 10.00 ns;",
+                "\t\tper_AllRefClkPins10ns = 10.00 ns;",
                 "\t\tRatio = 1.0;",
-                f"    {period_var} = {period_value:.6f} ns;",
                 "}"
             ]
             path_out.write_text('\n'.join(header + [""] + imports) + '\n')
             format_file(path_out)
             os.chmod(path_out, 0o777)
         def handle_tim(path_in, path_out, pattern, period_var):
+#            print(f"Generating _tim.spec for pattern {pattern} with period_var: {period_var}")
             lines = path_in.read_text().splitlines()
             header = read_header(lines)
             pad_signals, setup_blocks = [], []
             current_block = []
             capture = False
+            wft_name = extract_wft_name(path_in)
             for line in lines:
                 if line.strip().startswith("setup digInOut"):
                     pins = extract_pads(line)
@@ -402,13 +433,13 @@ def generate_timing_files(csv_path: Path, temp_dir: Path, debug_dir: Path) -> No
                         capture = False
             gallio_block = [
                 f"setup digInOut G_ALL_IO - {' - '.join(pad_signals)} {{",
-                "    set timing wft {",
+                f"    set timing {wft_name} {{",
                 append_ratio(f"        period = {period_var};", period_var),
                 append_ratio(f"        d1 = 0.0 * {period_var};", period_var),
                 "    }",
                 "}"
             ]
-            body = ['    set wft;'] + gallio_block + setup_blocks
+            body = [f"    set {wft_name};"] + gallio_block + setup_blocks
             content = header + [
                 f"import Timings.global.{pattern}_spec_decl;",
                 "import configuration.IO_Group;",
@@ -453,28 +484,51 @@ def generate_timing_files(csv_path: Path, temp_dir: Path, debug_dir: Path) -> No
             ratio_file.write_text('\n'.join(content) + '\n')
             format_file(ratio_file)
             os.chmod(ratio_file, 0o777)
-        spec_files_found = False
+        
+        # 第一遍：處理 _spec_decl.spec 文件，儲存 period_var
         for file in input_dir.iterdir():
             if not file.is_file() or file.suffix != ".spec":
                 continue
             name = file.stem
+ #           print(f"Processing file: {file.name}")
             matched = None
             for pat in pattern_set:
                 if name.startswith(pat):
                     matched = pat
                     break
             if not matched:
+                print(f"No pattern match for file: {file.name}")
+                continue
+            if "_spec_decl" in name:
+                period_var = get_period_from_spec_decl(file)
+                period_vars[matched] = period_var
+                handle_spec_decl(file, output_dir / file.name, matched)
+        
+        # 第二遍：處理其他 .spec 文件，使用對應的 period_var
+        spec_files_found = False
+        for file in input_dir.iterdir():
+            if not file.is_file() or file.suffix != ".spec":
+                continue
+            name = file.stem
+#            print(f"Processing file: {file.name}")
+            matched = None
+            for pat in pattern_set:
+                if name.startswith(pat):
+                    matched = pat
+                    break
+            if not matched:
+                print(f"No pattern match for file: {file.name}")
                 continue
             spec_files_found = True
-            period_var, period_value = get_period_from_spec_decl(file) if "_spec_decl" in name else ("per_40", 40.0)
-            if "_spec_decl" in name:
-                handle_spec_decl(file, output_dir / file.name, matched)
-            elif "_specs" in name:
-                handle_specs(file, output_dir / file.name, matched, period_var, period_value)
+            # 使用對應模式的 period_var，默認為 per_40
+            period_var = period_vars.get(matched, "per_40")
+            if "_specs" in name:
+                handle_specs(file, output_dir / file.name, matched)
             elif "_tim" in name:
                 handle_tim(file, output_dir / file.name, matched, period_var)
             elif "_wvt" in name:
                 handle_wvt(file, output_dir / file.name)
+        
         if not spec_files_found:
             raise FileNotFoundError(f"No matching .spec files found in {input_dir}")
         generate_timing_ratio_file(output_dir)
@@ -496,7 +550,7 @@ def generate_sequence_files(csv_path: Path, debug_dir: Path) -> None:
                 f.write(f"""sequence {pattern_name}_Pseq {{
     parallel {{
         sequential {{
-            patternCall Patterns.global.AllRefCLkPinslOns_diff;
+            patternCall Patterns.global.AllRefClkPins10ns_diff;
         }}
         sequential {{
             patternCall Patterns.global.{pattern_name};
@@ -630,7 +684,7 @@ def generate_flow_files(csv_path: Path, debug_dir: Path, timestamp: str) -> None
             def generate_tracking_blocks(self, preamble_suites: List[str], y_start: float, y_stop: float) -> str:
                 tracking_blocks = ""
                 for i, suite in enumerate(preamble_suites, 1):
-                    resource_name = f"Timings.{suite}.project_tim_specs.per_AllRefClkPins10ns_wvt"
+                    resource_name = f"Timings.{suite}.project_tim_specs.per_AllRefClkPins10ns"
                     tracking_blocks += f"""                tracking[pr{i}] = {{resourceType = specVariable;resourceName = "{resource_name}";range.start = {y_start};range.stop = {y_stop};}};\n"""
                 return tracking_blocks.strip()
             def generate_flow_file(self, df: pd.DataFrame, db_id: str) -> None:
@@ -687,7 +741,7 @@ def generate_flow_files(csv_path: Path, debug_dir: Path, timestamp: str) -> None
                         if suite_names:
                             y_suite = suite_names[-1]
                             preamble_suites = suite_names[:-1]
-                            y_timing_spec = f"{self.config.default_timing_prefix}.{y_suite}.project_tim_specs.per_AllRefClkPins10ns_wvt"
+                            y_timing_spec = f"{self.config.default_timing_prefix}.{y_suite}.per_AllRefClkPins10ns"
                             tracking_blocks = self.generate_tracking_blocks(preamble_suites, y_start, y_stop)
                         else:
                             y_timing_spec = ""
@@ -858,15 +912,13 @@ def copy_source_files(raw_dir: Path, debug_dir: Path, config: Config, timestamp:
         results = []
         for root, _, files in os.walk(config.SOURCE_DIR):
             for file in files:
-                print(file)
                 if any(file.endswith(suffix) for suffix in config.TARGET_SUFFIXES):
-                    print(file)
                     src_path = Path(root) / file
                     if file.endswith(".pat"):
                         dst_path = patterns_dir / file
-                    else:  # .spec 檔案（_wvt.spec, _tim.spec, _spec_decl.spec, _specs.spec）
+                    else:  # .spec files (_wvt.spec, _tim.spec, _spec_decl.spec, _specs.spec)
                         dst_path = timings_dir / file
-                    shutil.copy2(src_path, dst_path)  # 使用 copy2 保留元數據
+                    shutil.copy2(src_path, dst_path)  # Use copy2 to preserve metadata
                     os.chmod(dst_path, 0o777)
                     results.append({"File": file, "CopiedTo": str(dst_path), "Status": "SUCCESS"})
         summary_file = raw_dir / f"source_copy_summary_{timestamp}.csv"
@@ -901,7 +953,7 @@ def main(tab_name: str, email: str):
         os.chmod(temp_dir, 0o777)
         generate_timing_files(csv_path, temp_dir, debug_dir)
         generate_sequence_files(csv_path, debug_dir)
-        copy_source_files(raw_dir, debug_dir, config, timestamp)  # 新增調用
+        copy_source_files(raw_dir, debug_dir, config, timestamp)
         generate_flow_files(csv_path, debug_dir, timestamp)
         zip_file = package_outputs(debug_dir, batch_id)
         dest_zip = copy_to_testprogram(zip_file, batch_id, config)

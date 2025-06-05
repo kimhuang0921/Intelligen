@@ -7,7 +7,7 @@
    Source File:     AllRefClkPins10ns_diff.stil Mon May  5 13:48:10 2025
 ---------------------------------------------------------------------- */
 import configuration.IO_Group;
-import Timings.galbal.TimingRatio;
+import Timings.global.TimingRatio;
 spec project_tim_spec_decl {
     var Time per_AllRefClkPins10ns_wvt;
 }

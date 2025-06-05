@@ -10,7 +10,7 @@
 
 import configuration.IO_Group;
 
-spec project_wvt {
+spec AllRefClkPins10ns_diff_wvt {
     setup digInOut pad_pcie1_refclk100_1_n + pad_top_d2ds_phy4_refclk100_n + pad_top_d2ds_phy2_refclk100_n + pad_top_d2ds_phy0_refclk100_n + pad_top_d2ds_phy3_refclk100_n + pad_ams_pdp_0_pad_refclk_n + pad_pcie1_refclk100_2_n + pad_top_d2ds_phy1_refclk100_n + pad_ams_pdp_1_pad_refclk_n + pad_pcie0_refclk100_3_n + pad_pcie1_refclk100_0_n + pad_pcie0_refclk100_2_n + pad_refclk_100_n + pad_refclk_100_spare_n + pad_pcie1_refclk100_3_n + pad_pcie0_refclk100_1_n + pad_pcie0_refclk100_0_n {
         wavetable AllRefClkPins10ns_wvt {
             xModes=1;
