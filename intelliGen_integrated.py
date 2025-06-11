@@ -215,6 +215,7 @@ def convert_excel_to_csv(xlsx_path: Path, sheet_name: str, raw_dir: Path) -> Pat
         def build_timing_spec(flow_path: str) -> str:
             pattern_name = extract_file_base(flow_path)
             return f"time_{pattern_name}" if pattern_name else "time_default"
+
         preamble_mapping = build_preamble_mapping(preamble_df)
         plan_df.columns = [col.strip().lower() for col in plan_df.columns]
         columns = ['shmoo x signal', 'shmoo x start', 'shmoo x stop', 'shmoo x step size',
@@ -223,6 +224,7 @@ def convert_excel_to_csv(xlsx_path: Path, sheet_name: str, raw_dir: Path) -> Pat
             raise ValueError("Missing required column 'pattern name (with full path)'")
         output_rows = []
         patterns = set()
+        relay_combinations = set()
         db_id = 1
         for idx, row in plan_df.iterrows():
             full_path = row.get("pattern name (with full path)", "")
@@ -235,8 +237,10 @@ def convert_excel_to_csv(xlsx_path: Path, sheet_name: str, raw_dir: Path) -> Pat
                 continue
             preamble_set = str(row.get("preamble set", "")).strip().lower()
             preamble_list = get_preamble_list(pattern_name, full_path, preamble_set, preamble_mapping)
+            relay = row.get("relay", "")
+            if relay and not pd.isna(relay):
+                relay_combinations.add(relay)
             group_id = f"DB{db_id}"
-            db_id += 1
             patterns.add(full_path)
             patterns.update(preamble_list)
             for preamble in preamble_list:
@@ -246,7 +250,8 @@ def convert_excel_to_csv(xlsx_path: Path, sheet_name: str, raw_dir: Path) -> Pat
                     "Suites": preamble,
                     "Timing Spec": build_timing_spec(preamble),
                     "TestMethod": "FunctionalTest_wo_profiling",
-                    **{col: "" for col in columns}
+                    **{col: "" for col in columns},
+                    "Relay": ""
                 })
             output_rows.append({
                 "Identifier": group_id,
@@ -254,13 +259,20 @@ def convert_excel_to_csv(xlsx_path: Path, sheet_name: str, raw_dir: Path) -> Pat
                 "Suites": full_path,
                 "Timing Spec": build_timing_spec(full_path),
                 "TestMethod": row.get("testmethod", "FunctionalTest_wo_profiling"),
-                **{col: row.get(col, "") for col in columns}
+                **{col: row.get(col, "") for col in columns},
+                "Relay": relay
             })
+            db_id += 1
         output_df = pd.DataFrame(output_rows)
         output_path.parent.mkdir(parents=True, exist_ok=True)
         os.chmod(output_path.parent, 0o777)
         output_df.to_csv(output_path, index=False)
         os.chmod(output_path, 0o777)
+        relay_output = output_path.parent / "relay_combinations.txt"
+        with open(relay_output, "w") as f:
+            for relay in relay_combinations:
+                f.write(f"{relay}\n")
+        os.chmod(relay_output, 0o777)
         path_list, warning = check_pattern_paths(patterns)
         path_output = output_path.parent / "pattern_paths.txt"
         with open(path_output, "w") as f:
@@ -601,13 +613,14 @@ def generate_sequence_files(csv_path: Path, debug_dir: Path) -> None:
         print(format_error_message("Step 6: Sequence generation failed", e))
         raise
 
+
 def generate_flow_files(csv_path: Path, debug_dir: Path, timestamp: str) -> None:
     try:
         @dataclass
         class FlowConfig:
             extensions: List[str] = None
             default_testmethod: str = "FunctionalTest_wo_profiling"
-            default_timing_prefix: str = "Timings.global."
+            default_timing_prefix: str = "Timings"
             level_spec: str = "Levels.DFT_Vtyp.DFT_Vtyp_specValue"
             max_failed_cycles: int = 20000
             ffv_cycles: int = 20000
@@ -728,32 +741,54 @@ def generate_flow_files(csv_path: Path, debug_dir: Path, timestamp: str) -> None
             def generate_tracking_blocks(self, preamble_suites: List[str], y_start: float, y_stop: float) -> str:
                 tracking_blocks = ""
                 for i, suite in enumerate(preamble_suites, 1):
-                    resource_name = f"Timings.{suite}.project_tim_specs.per_AllRefClkPins10ns"
+                    resource_name = f"Timings.global.{suite}_specs.per_AllRefClkPins10ns"
                     tracking_blocks += f"""                tracking[pr{i}] = {{resourceType = specVariable;resourceName = "{resource_name}";range.start = {y_start};range.stop = {y_stop};}};\n"""
                 return tracking_blocks.strip()
             def generate_flow_file(self, df: pd.DataFrame, db_id: str) -> None:
                 pattern_row = df[df["Identifier"] == db_id]
                 if pattern_row.empty:
-                    print(f"Step 7: No rows found for {db_id}")
+                    print(f"Step 7: No rows found for {db_id}, skipping")
                     return
                 if not pattern_row["Flows"].nunique() == 1:
-                    print(f"Step 7: Multiple Flows values found for {db_id}: {pattern_row['Flows'].unique()}")
-                    return
+                    print(f"Step 7: Multiple Flows values found for {db_id}: {pattern_row['Flows'].unique()}, using first")
+                    pattern_row = pattern_row[pattern_row["Flows"] == pattern_row["Flows"].iloc[0]]
                 main_row = pattern_row.iloc[-1]
                 suite_names = []
                 for _, row in pattern_row.iterrows():
                     suite_name = self.suite_generator.extract_basename(str(row["Suites"]))
-                    suite_names.append(suite_name)
-                flow_name = f"RV_{suite_names[-1]}_{db_id}" if suite_names else f"RV_{db_id}"
+                    if suite_name:
+                        suite_names.append(suite_name)
+                    else:
+                        print(f"Step 7: Invalid suite name for row in {db_id}, skipping row")
+                if not suite_names:
+                    print(f"Step 7: No valid suites for {db_id}, skipping")
+                    return
+                flow_name = f"RV_{suite_names[-1]}_{db_id}"
                 flow_block = self.config.flow_header_template.format(flow_name=flow_name)
+                relay = main_row.get("Relay", "")
+                relay_name = relay.replace("+", "_") if relay and not pd.isna(relay) else ""
+                if relay_name:
+                    flow_block += f"""    suite relay_on_{relay_name} calls misc.UtilityAction {{
+        UtilityPins_to_On = "{relay.replace('_', '+').upper()}"; 
+    }}
+"""
                 for suite_name in suite_names:
                     testmethod = main_row.get("TestMethod", self.config.default_testmethod)
                     timing = f"{self.config.default_timing_prefix}.global.{suite_name}_specs"
                     flow_block += self.suite_generator.generate_suite_block(suite_name, testmethod, timing, main_row)
+                if relay_name:
+                    flow_block += f"""    suite relay_off_{relay_name} calls misc.UtilityAction {{
+        UtilityPins_to_Off = "{relay.replace('_', '+').upper()}";  
+    }}
+"""
                 flow_block += "\n    }\n"
                 flow_block += "\n    execute {\n"
+                if relay_name:
+                    flow_block += f"        relay_on_{relay_name}.execute();\n"
                 for name in suite_names:
                     flow_block += f"        {name}.execute();\n"
+                if relay_name:
+                    flow_block += f"        relay_off_{relay_name}.execute();\n"
                 flow_block += "    }\n}\n"
                 shmoo_data = None
                 if pd.notna(main_row.get("shmoo x signal")):
@@ -794,7 +829,7 @@ def generate_flow_files(csv_path: Path, debug_dir: Path, timestamp: str) -> None
                         if suite_names:
                             y_suite = suite_names[-1]
                             preamble_suites = suite_names[:-1]
-                            y_timing_spec = f"{self.config.default_timing_prefix}.{y_suite}_specs.per_AllRefClkPins10ns"
+                            y_timing_spec = f"{self.config.default_timing_prefix}.global.{y_suite}_specs.per_AllRefClkPins10ns"
                             tracking_blocks = self.generate_tracking_blocks(preamble_suites, y_start, y_stop)
                         else:
                             y_timing_spec = ""
@@ -827,7 +862,7 @@ def generate_flow_files(csv_path: Path, debug_dir: Path, timestamp: str) -> None
                         }
                     except Exception as e:
                         print(f"Step 7: Failed to generate shmoo data for {db_id}: {e}")
-                self.flow_info.append({"flow_name": flow_name, "shmoo_data": shmoo_data})
+                self.flow_info.append({"flow_name": flow_name, "shmoo_data": shmoo_data, "db_id": db_id})
                 output_path = self.output_dir / f"{flow_name}.flow"
                 output_path.parent.mkdir(parents=True, exist_ok=True)
                 os.chmod(output_path.parent, 0o777)
@@ -841,7 +876,7 @@ def generate_flow_files(csv_path: Path, debug_dir: Path, timestamp: str) -> None
                 setup_block = ""
                 shmoo_block = ""
                 execute_block = ""
-                for info in sorted(self.flow_info, key=lambda x: x["flow_name"]):
+                for info in sorted(self.flow_info, key=lambda x: int(x["db_id"].replace("DB", ""))):
                     flow_name = info["flow_name"]
                     setup_block += f"        flow {flow_name} calls Flows.{self.csv_name}.{flow_name}{{}}\n"
                     execute_block += f"        {flow_name}.execute();\n"
@@ -871,7 +906,7 @@ def generate_flow_files(csv_path: Path, debug_dir: Path, timestamp: str) -> None
         if not all(col in df.columns for col in required_columns):
             raise ValueError(f"Missing required columns: {set(required_columns) - set(df.columns)}")
         generator = FlowGenerator(config, str(csv_path), str(debug_dir), timestamp)
-        identifiers = sorted(set(df["Identifier"]))
+        identifiers = sorted(set(df["Identifier"]), key=lambda x: int(x.replace("DB", "")))
         for db_id in identifiers:
             generator.generate_flow_file(df, db_id)
         generator.generate_main_flow()
@@ -991,13 +1026,19 @@ def process_queue():
     ensure_queue_file()
     df = pd.read_csv(config.QUEUE_FILE)
     pending_tasks = df[df["Status"] == "WAIT"]
-    for _, row in pending_tasks.iterrows():
+    for idx, row in pending_tasks.iterrows():
         tab_name = row["TabName"]
         email = row["Email"]
         log_buffer = io.StringIO()
         original_stdout = sys.stdout
         sys.stdout = log_buffer
         try:
+            # 設置狀態為 RUNNING，僅針對當前行的索引
+            df.loc[idx, "Status"] = "RUNNING"
+            df.loc[idx, "LastUpdate"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            df.to_csv(config.QUEUE_FILE, index=False, quoting=csv.QUOTE_ALL)
+            print(f"[INFO] Task '{tab_name}' (Index: {idx}) status set to RUNNING")
+
             timestamp = datetime.now().strftime("%m%d%H%M%S")
             batch_id = f"{tab_name}_{timestamp}"
             raw_dir = config.RAW_DIR / batch_id
@@ -1025,21 +1066,22 @@ def process_queue():
             sys.stdout = original_stdout
             log_content = log_buffer.getvalue()
             send_email(email, batch_id, dest_zip, config, log_content)
-            df.loc[df["TabName"] == tab_name, "Status"] = "DONE"
-            df.loc[df["TabName"] == tab_name, "LastUpdate"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            # 設置狀態為 DONE，僅針對當前行的索引
+            df.loc[idx, "Status"] = "DONE"
+            df.loc[idx, "LastUpdate"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             df.to_csv(config.QUEUE_FILE, index=False, quoting=csv.QUOTE_ALL)
-            print(f"Workflow completed for tab '{tab_name}'")
+            print(f"Workflow completed for tab '{tab_name}' (Index: {idx})")
         except Exception as e:
             sys.stdout = original_stdout
             log_content = log_buffer.getvalue()
-            print(format_error_message(f"Workflow failed for tab '{tab_name}'", e))
+            print(format_error_message(f"Workflow failed for tab '{tab_name}' (Index: {idx})", e))
             send_email(email, batch_id, zip_file if 'zip_file' in locals() else Path("N/A"), config, log_content)
-            df.loc[df["TabName"] == tab_name, "Status"] = "FAILED"
-            df.loc[df["TabName"] == tab_name, "LastUpdate"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            # 設置狀態為 FAILED，僅針對當前行的索引
+            df.loc[idx, "Status"] = "FAILED"
+            df.loc[idx, "LastUpdate"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             df.to_csv(config.QUEUE_FILE, index=False, quoting=csv.QUOTE_ALL)
         finally:
             log_buffer.close()
-
 def main(tab_name: str = None, email: str = None, generate: bool = False):
     if generate:
         process_queue()
